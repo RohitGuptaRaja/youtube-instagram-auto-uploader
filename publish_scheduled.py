@@ -1,13 +1,11 @@
 """
-STEP 2 of the pipeline. Run this on a frequent schedule (e.g. every 10-15 min
-via Task Scheduler or GitHub Actions). It checks publish_queue.json for anything
-whose go_live_at time has arrived, then:
+STEP 2 of the pipeline (Instagram-only version). Run this on a frequent schedule 
+(e.g. every 10-15 min via Task Scheduler or GitHub Actions). It checks 
+publish_queue.json for anything whose go_live_at time has arrived, then:
 
-  1. Flips the YouTube video from unlisted -> public
-  2. Publishes the same video to Instagram as a Reel (first time it's ever
-     touched Instagram -- there's no "hold and schedule" on IG's side)
-  3. Revokes the Drive file's public-link permission (no longer needed)
-  4. Prunes old published entries from the queue (keeps file size bounded)
+   1. Publishes the video to Instagram as a Reel
+   2. Revokes the Drive file's public-link permission (no longer needed)
+   3. Prunes old published entries from the queue (keeps file size bounded)
 
     python publish_scheduled.py
 """
@@ -37,18 +35,6 @@ QUEUE_FILE = "publish_queue.json"
 
 # Prune published entries older than this many days to keep the queue file small
 QUEUE_PRUNE_DAYS = int(os.environ.get("QUEUE_PRUNE_DAYS", "30"))
-
-
-# ---------------------------------------------------------------------------
-# YouTube helpers
-# ---------------------------------------------------------------------------
-
-def set_youtube_public(youtube, video_id: str) -> None:
-    """Flip *video_id* from unlisted to public."""
-    youtube.videos().update(
-        part="status",
-        body={"id": video_id, "status": {"privacyStatus": "public"}},
-    ).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -116,16 +102,11 @@ def main() -> None:
         return
 
     creds = get_credentials()
-    youtube = build("youtube", "v3", credentials=creds)
     drive = build("drive", "v3", credentials=creds)
 
     for item in due:
-        yt_id = item["youtube_video_id"]
         drive_file_id = item.get("drive_file_id")
-        logger.info("Publishing slot %s video: %s", item["slot"], yt_id)
-
-        logger.info("  Setting YouTube to public...")
-        set_youtube_public(youtube, yt_id)
+        logger.info("Publishing slot %s video to Instagram", item["slot"])
 
         logger.info("  Posting to Instagram as Reel...")
         try:
@@ -133,7 +114,7 @@ def main() -> None:
             logger.info("  Instagram media ID: %s", ig_media_id)
         except Exception as exc:
             logger.error(
-                "  Instagram publish FAILED (YouTube still went public): %s", exc
+                "  Instagram publish FAILED: %s", exc
             )
             # Continue processing other items; don't mark as published so it
             # can be retried manually.
