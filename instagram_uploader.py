@@ -2,10 +2,13 @@
 Publishes a video (Reel) to Instagram via the Meta Graph API.
 
 Instagram's Content Publishing API requires the video to be reachable at a
-PUBLIC URL (it fetches it server-side) -- you can't POST the file directly
-like YouTube. We use the Google Drive shareable link for this.
+PUBLIC URL (it fetches it server-side).
 
-Two-step process:
+Two methods:
+1. publish_reel() - Use Google Drive shareable link
+2. publish_reel_from_file() - Upload local file to temporary server, then publish
+
+Both follow the same two-step process:
   1. Create a media container (POST /{ig-user-id}/media)
   2. Poll until Instagram finishes processing the video
   3. Publish the container (POST /{ig-user-id}/media_publish)
@@ -18,6 +21,8 @@ calls this function exactly when it's time to go live, rather than ahead of time
 import logging
 import os
 import time
+import tempfile
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -84,7 +89,7 @@ def _publish_container(container_id: str) -> str:
 
 
 def publish_reel(video_public_url: str, caption: str) -> str:
-    """Upload and publish a Reel. Returns the published media ID.
+    """Upload and publish a Reel using a public URL. Returns the published media ID.
 
     Args:
         video_public_url: a publicly accessible URL Instagram's servers can fetch.
@@ -134,3 +139,105 @@ def publish_reel(video_public_url: str, caption: str) -> str:
     media_id = _publish_container(container_id)
     logger.info("  Reel published. Media ID: %s", media_id)
     return media_id
+
+
+def publish_reel_from_file(local_video_path: str, caption: str) -> str:
+    """Upload and publish a Reel from a local file. Returns the published media ID.
+
+    This function:
+    1. Reads the local video file
+    2. Uploads it to a temporary file hosting service (using file.io or similar)
+    3. Gets a public URL
+    4. Publishes to Instagram using that URL
+    5. Cleans up the temporary URL
+
+    Args:
+        local_video_path: path to the local MP4 video file.
+        caption: the Instagram caption including hashtags.
+
+    Raises:
+        ValueError: if required env vars are missing or file not found.
+        RuntimeError: if Instagram reports a processing error.
+        TimeoutError: if processing takes longer than ~5 minutes.
+        requests.HTTPError: on unrecoverable API errors (after retries).
+    """
+    if not IG_USER_ID or not ACCESS_TOKEN:
+        raise ValueError(
+            "IG_BUSINESS_ACCOUNT_ID and META_ACCESS_TOKEN must be set in .env"
+        )
+
+    # Verify file exists
+    if not os.path.exists(local_video_path):
+        raise ValueError(f"Video file not found: {local_video_path}")
+
+    # Upload to temporary file hosting (using file.io)
+    logger.info("  Uploading video to temporary hosting...")
+    try:
+        with open(local_video_path, "rb") as f:
+            files = {"file": f}
+            resp = requests.post(
+                "https://file.io",
+                files=files,
+                timeout=300,  # 5 minutes for upload
+            )
+        resp.raise_for_status()
+        
+        upload_data = resp.json()
+        if not upload_data.get("success"):
+            raise RuntimeError(f"File upload failed: {upload_data}")
+        
+        video_public_url = upload_data.get("link")
+        if not video_public_url:
+            raise RuntimeError("No public URL returned from file hosting")
+        
+        logger.info("  Video hosted at: %s", video_public_url)
+        
+    except Exception as exc:
+        logger.error("Failed to upload video to temporary hosting: %s", exc)
+        raise
+
+    try:
+        # Step 1: create container
+        logger.info("  Creating Instagram media container...")
+        container_id = _create_container(video_public_url, caption)
+        logger.info("  Container ID: %s", container_id)
+
+        # Step 2: poll until Instagram finishes processing
+        logger.info("  Waiting for Instagram to process video...")
+        for attempt in range(_MAX_POLL_ATTEMPTS):
+            status = _get_container_status(container_id)
+
+            if status == "FINISHED":
+                logger.info("  Processing complete after ~%ds.", attempt * _POLL_INTERVAL_SECONDS)
+                break
+            if status == "ERROR":
+                raise RuntimeError(
+                    f"Instagram failed to process video (container {container_id}). "
+                    "Check the video format — Instagram Reels require H.264/AAC MP4, "
+                    "9:16 or 1:1 aspect ratio, 3-90 seconds."
+                )
+
+            logger.debug("  Status: %s (attempt %d/%d)", status, attempt + 1, _MAX_POLL_ATTEMPTS)
+            time.sleep(_POLL_INTERVAL_SECONDS)
+        else:
+            raise TimeoutError(
+                f"Instagram video processing timed out after "
+                f"{_MAX_POLL_ATTEMPTS * _POLL_INTERVAL_SECONDS}s (container {container_id})."
+            )
+
+        # Step 3: publish
+        logger.info("  Publishing Reel...")
+        media_id = _publish_container(container_id)
+        logger.info("  Reel published. Media ID: %s", media_id)
+        return media_id
+
+    finally:
+        # Optionally: delete the temporary file from file.io
+        # Most services auto-delete after a few hours anyway
+        try:
+            if video_public_url:
+                delete_resp = requests.delete(video_public_url, timeout=10)
+                if delete_resp.status_code == 200:
+                    logger.debug("  Cleaned up temporary hosting file")
+        except Exception as exc:
+            logger.debug("  Could not delete temporary file: %s", exc)
